@@ -26,9 +26,10 @@ def train_baseline_model(filepath):
     # Define our target
     target = "Home_Win"
 
-    # We ONLY feed the model the differentials now.
+    # We ONLY feed the model the differentials and the environmental context.
     # We are dropping the raw team stats and the toxic 'Played_Yesterday' binary flags.
     features = [
+        "Park_Factor",  # NEW FEATURE!
         "OPS_Diff",
         "K_Rate_Diff",
         "Bullpen_ERA_Diff",
@@ -51,20 +52,23 @@ def train_baseline_model(filepath):
     y_test = test_df[target]
 
     # ==========================================
-    # TRAIN XGBOOST (With Regularization)
+    # TRAIN XGBOOST (With Early Stopping)
     # ==========================================
     print("\nTraining XGBoost model...")
     model = XGBClassifier(
-        n_estimators=200,  # Bumped to 200
-        learning_rate=0.01,  # Lowered from 0.03 to make it more cautious
-        max_depth=3,
+        n_estimators=500,  # Give it plenty of runway
+        learning_rate=0.01,  # Very slow, cautious learning
+        max_depth=3,  # Shallow trees to prevent memorization
         subsample=0.8,
         colsample_bytree=0.8,
+        early_stopping_rounds=20,  # Stop if 20 trees go by without improvement
         random_state=42,
     )
 
-    model.fit(X_train, y_train)
+    # We pass the 2026 test set into the fit function so it can monitor itself
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
+    print(f"Early stopping triggered! Model stopped at tree #{model.best_iteration}")
     # ==========================================
     # EVALUATE
     # ==========================================

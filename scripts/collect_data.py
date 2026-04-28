@@ -206,3 +206,4 @@ if __name__ == "__main__":
     seasons_to_pull = [2024, 2025, 2026]
     output_file = "data/mlb_historical_games.csv"
     build_dataset(seasons_to_pull, output_file, max_workers=15)  # Bumped workers to 15!
+

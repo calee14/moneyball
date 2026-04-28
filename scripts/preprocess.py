@@ -18,23 +18,17 @@ def build_predictive_dataset(filepath):
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values(by=["Date", "Game_ID"]).reset_index(drop=True)
 
-    # Convert all IP strings
     ip_cols = ["Away_SP_IP", "Home_SP_IP", "Away_Team_IP", "Home_Team_IP"]
     for col in ip_cols:
         df[f"{col}_Math"] = df[col].apply(convert_ip_to_math)
 
-    # Calculate Bullpen Game Stats (Team Total - Starter Total)
     df["Away_Bullpen_ER"] = df["Away_Team_ER"] - df["Away_SP_ER"]
     df["Away_Bullpen_IP"] = df["Away_Team_IP_Math"] - df["Away_SP_IP_Math"]
     df["Home_Bullpen_ER"] = df["Home_Team_ER"] - df["Home_SP_ER"]
     df["Home_Bullpen_IP"] = df["Home_Team_IP_Math"] - df["Home_SP_IP_Math"]
 
-    # ==========================================
-    # 1. PROCESS TEAM ROLLING STATS (Offense + Bullpen + Rest)
-    # ==========================================
+    # --- TEAM STATS (Unchanged) ---
     print("Calculating Team Last-30-Game OPS, Bullpen ERA, and Rest...")
-
-    # Isolate Home and Away logs, standardizing names
     home_cols = [
         "Game_ID",
         "Date",
@@ -52,7 +46,6 @@ def build_predictive_dataset(filepath):
         "Home_Bullpen_IP",
     ]
     home_teams = df[home_cols].rename(columns=lambda x: x.replace("Home_", ""))
-
     away_cols = [
         "Game_ID",
         "Date",
@@ -73,13 +66,11 @@ def build_predictive_dataset(filepath):
 
     team_logs = pd.concat([home_teams, away_teams]).sort_values(by=["Date", "Game_ID"])
 
-    # REST CALCULATION: Did they play yesterday?
     team_logs["Days_Since_Last_Game"] = team_logs.groupby("Team")["Date"].diff().dt.days
     team_logs["Played_Yesterday"] = np.where(
         team_logs["Days_Since_Last_Game"] == 1, 1, 0
     )
 
-    # ROLL RAW STATS OVER LAST 5 GAMES
     metrics = [
         "AB",
         "Hits",
@@ -98,8 +89,6 @@ def build_predictive_dataset(filepath):
             lambda x: x.shift(1).rolling(window=30, min_periods=1).sum()
         )
 
-    # CALCULATE ADVANCED METRICS FROM ROLLED SUMS
-    # 1. OPS = OBP + SLG
     obp_num = (
         team_logs["Sum_Hits_L5"] + team_logs["Sum_BB_L5"] + team_logs["Sum_HBP_L5"]
     )
@@ -124,9 +113,8 @@ def build_predictive_dataset(filepath):
     )
     team_logs["Team_OPS_L5"] += np.where(
         team_logs["Sum_AB_L5"] > 0, slg_num / team_logs["Sum_AB_L5"], 0.0
-    )  # Add SLG to OBP
+    )
 
-    # 2. Strikeout Rate & Bullpen ERA
     team_logs["Team_K_Rate_L5"] = np.where(
         team_logs["Sum_AB_L5"] > 0, team_logs["Sum_K_L5"] / team_logs["Sum_AB_L5"], 0.0
     )
@@ -136,7 +124,6 @@ def build_predictive_dataset(filepath):
         0.0,
     )
 
-    # Split back and merge
     final_features = [
         "Game_ID",
         "Team",
@@ -159,29 +146,46 @@ def build_predictive_dataset(filepath):
     df = df.merge(home_merge, on=["Game_ID", "Home_Team"], how="left")
     df = df.merge(away_merge, on=["Game_ID", "Away_Team"], how="left")
 
-    # ==========================================
-    # 2. PROCESS PITCHER ROLLING STATS (Last 5 Starts)
-    # ==========================================
-    print("Calculating Pitcher PreGame ERA and K/9...")
+    # --- PITCHER FIP MATH ---
+    print("Calculating Pitcher PreGame FIP and K/9...")
 
+    # We now pull BB and HR into our pitcher logs
     home_pitchers = df[
-        ["Game_ID", "Date", "Home_SP", "Home_SP_ER", "Home_SP_IP_Math", "Home_SP_K"]
+        [
+            "Game_ID",
+            "Date",
+            "Home_SP",
+            "Home_SP_IP_Math",
+            "Home_SP_K",
+            "Home_SP_BB",
+            "Home_SP_HR",
+        ]
     ].rename(
         columns={
             "Home_SP": "Pitcher",
-            "Home_SP_ER": "ER",
             "Home_SP_IP_Math": "IP",
             "Home_SP_K": "K",
+            "Home_SP_BB": "BB",
+            "Home_SP_HR": "HR",
         }
     )
     away_pitchers = df[
-        ["Game_ID", "Date", "Away_SP", "Away_SP_ER", "Away_SP_IP_Math", "Away_SP_K"]
+        [
+            "Game_ID",
+            "Date",
+            "Away_SP",
+            "Away_SP_IP_Math",
+            "Away_SP_K",
+            "Away_SP_BB",
+            "Away_SP_HR",
+        ]
     ].rename(
         columns={
             "Away_SP": "Pitcher",
-            "Away_SP_ER": "ER",
             "Away_SP_IP_Math": "IP",
             "Away_SP_K": "K",
+            "Away_SP_BB": "BB",
+            "Away_SP_HR": "HR",
         }
     )
 
@@ -189,42 +193,54 @@ def build_predictive_dataset(filepath):
         by=["Date", "Game_ID"]
     )
 
-    pitcher_logs["Rolling_ER"] = pitcher_logs.groupby("Pitcher")["ER"].transform(
-        lambda x: x.shift(1).rolling(window=15, min_periods=1).sum()
-    )
+    # Roll the stats over the last 15 starts
     pitcher_logs["Rolling_IP"] = pitcher_logs.groupby("Pitcher")["IP"].transform(
         lambda x: x.shift(1).rolling(window=15, min_periods=1).sum()
     )
     pitcher_logs["Rolling_K"] = pitcher_logs.groupby("Pitcher")["K"].transform(
         lambda x: x.shift(1).rolling(window=15, min_periods=1).sum()
     )
+    pitcher_logs["Rolling_BB"] = pitcher_logs.groupby("Pitcher")["BB"].transform(
+        lambda x: x.shift(1).rolling(window=15, min_periods=1).sum()
+    )
+    pitcher_logs["Rolling_HR"] = pitcher_logs.groupby("Pitcher")["HR"].transform(
+        lambda x: x.shift(1).rolling(window=15, min_periods=1).sum()
+    )
 
-    pitcher_logs["SP_PreGame_ERA"] = np.where(
+    # FIP = ((13*HR) + (3*BB) - (2*K)) / IP + 3.20
+    fip_numerator = (
+        (13 * pitcher_logs["Rolling_HR"])
+        + (3 * pitcher_logs["Rolling_BB"])
+        - (2 * pitcher_logs["Rolling_K"])
+    )
+    pitcher_logs["SP_PreGame_FIP"] = np.where(
         pitcher_logs["Rolling_IP"] > 0,
-        (pitcher_logs["Rolling_ER"] / pitcher_logs["Rolling_IP"]) * 9,
+        (fip_numerator / pitcher_logs["Rolling_IP"]) + 3.20,
         0.0,
     )
+
     pitcher_logs["SP_PreGame_K9"] = np.where(
         pitcher_logs["Rolling_IP"] > 0,
         (pitcher_logs["Rolling_K"] / pitcher_logs["Rolling_IP"]) * 9,
         0.0,
     )
 
+    # Merge FIP back into main dataset
     home_p_merge = pitcher_logs[
-        ["Game_ID", "Pitcher", "SP_PreGame_ERA", "SP_PreGame_K9"]
+        ["Game_ID", "Pitcher", "SP_PreGame_FIP", "SP_PreGame_K9"]
     ].rename(
         columns={
             "Pitcher": "Home_SP",
-            "SP_PreGame_ERA": "Home_SP_PreGame_ERA",
+            "SP_PreGame_FIP": "Home_SP_PreGame_FIP",
             "SP_PreGame_K9": "Home_SP_PreGame_K9",
         }
     )
     away_p_merge = pitcher_logs[
-        ["Game_ID", "Pitcher", "SP_PreGame_ERA", "SP_PreGame_K9"]
+        ["Game_ID", "Pitcher", "SP_PreGame_FIP", "SP_PreGame_K9"]
     ].rename(
         columns={
             "Pitcher": "Away_SP",
-            "SP_PreGame_ERA": "Away_SP_PreGame_ERA",
+            "SP_PreGame_FIP": "Away_SP_PreGame_FIP",
             "SP_PreGame_K9": "Away_SP_PreGame_K9",
         }
     )
@@ -232,12 +248,43 @@ def build_predictive_dataset(filepath):
     df = df.merge(home_p_merge, on=["Game_ID", "Home_SP"], how="left")
     df = df.merge(away_p_merge, on=["Game_ID", "Away_SP"], how="left")
 
-    # ==========================================
-    # 3. CLEAN UP AND IMPUTE MISSING DATA
-    # ==========================================
-    print("Dropping leaky in-game stats...")
+    # --- CLEANUP ---
+    print("Adding MLB Park Factors...")
+    PARK_FACTORS = {
+        "Colorado Rockies": 112,
+        "Cincinnati Reds": 107,
+        "Boston Red Sox": 106,
+        "Texas Rangers": 103,
+        "Los Angeles Dodgers": 102,
+        "Chicago White Sox": 101,
+        "Atlanta Braves": 101,
+        "Philadelphia Phillies": 101,
+        "Los Angeles Angels": 100,
+        "Houston Astros": 100,
+        "Baltimore Orioles": 99,
+        "Washington Nationals": 99,
+        "Arizona Diamondbacks": 99,
+        "Toronto Blue Jays": 99,
+        "New York Yankees": 99,
+        "Milwaukee Brewers": 98,
+        "Chicago Cubs": 98,
+        "Kansas City Royals": 98,
+        "Minnesota Twins": 98,
+        "Pittsburgh Pirates": 97,
+        "Tampa Bay Rays": 97,
+        "San Francisco Giants": 97,
+        "Miami Marlins": 96,
+        "New York Mets": 96,
+        "St. Louis Cardinals": 96,
+        "Oakland Athletics": 95,
+        "Detroit Tigers": 95,
+        "San Diego Padres": 95,
+        "Cleveland Guardians": 94,
+        "Seattle Mariners": 92,
+    }
+    df["Park_Factor"] = df["Home_Team"].map(PARK_FACTORS).fillna(100)
 
-    # Keep ONLY our engineered features and identifiers
+    print("Dropping leaky in-game stats...")
     cols_to_keep = [
         "Game_ID",
         "Date",
@@ -246,18 +293,19 @@ def build_predictive_dataset(filepath):
         "Away_SP",
         "Home_SP",
         "Home_Win",
+        "Park_Factor",
         "Away_Played_Yesterday",
         "Away_Team_OPS_L5",
         "Away_Team_K_Rate_L5",
         "Away_Bullpen_ERA_L5",
-        "Away_SP_PreGame_ERA",
-        "Away_SP_PreGame_K9",
+        "Away_SP_PreGame_FIP",
+        "Away_SP_PreGame_K9",  # Swapped ERA for FIP
         "Home_Played_Yesterday",
         "Home_Team_OPS_L5",
         "Home_Team_K_Rate_L5",
         "Home_Bullpen_ERA_L5",
-        "Home_SP_PreGame_ERA",
-        "Home_SP_PreGame_K9",
+        "Home_SP_PreGame_FIP",
+        "Home_SP_PreGame_K9",  # Swapped ERA for FIP
     ]
     df = df[cols_to_keep].copy()
 
@@ -266,12 +314,10 @@ def build_predictive_dataset(filepath):
     for col in feature_cols:
         df[col] = df[col].fillna(df[col].median())
 
-    # Played yesterday shouldn't be imputed with median, fill NaNs with 0 (no they didn't play)
     df["Away_Played_Yesterday"] = df["Away_Played_Yesterday"].fillna(0)
     df["Home_Played_Yesterday"] = df["Home_Played_Yesterday"].fillna(0)
 
     final_df = df.dropna().reset_index(drop=True)
-
     print(
         f"Preprocessing complete! Dataset contains {len(final_df)} model-ready games."
     )
@@ -281,6 +327,4 @@ def build_predictive_dataset(filepath):
 if __name__ == "__main__":
     model_data = build_predictive_dataset("data/mlb_historical_games.csv")
     model_data.to_csv("data/mlb_model_ready.csv", index=False)
-    print("\nFinal Predictive Features:")
-    print(model_data.columns.tolist())
 
