@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, log_loss
 
@@ -9,39 +8,27 @@ def train_baseline_model(filepath):
     df = pd.read_csv(filepath)
     df["Date"] = pd.to_datetime(df["Date"])
 
-    # ==========================================
-    # FEATURE ENGINEERING: DIFFERENTIALS
-    # ==========================================
-    # Instead of looking at teams in isolation, we look at the GAP between them.
-    # Positive numbers mean the Home Team has the advantage. Negative means Away.
-
+    # CALCULATE DIFFERENTIALS
     df["OPS_Diff"] = df["Home_Team_OPS_L5"] - df["Away_Team_OPS_L5"]
     df["K_Rate_Diff"] = df["Home_Team_K_Rate_L5"] - df["Away_Team_K_Rate_L5"]
-    df["Bullpen_ERA_Diff"] = (
-        df["Away_Bullpen_ERA_L5"] - df["Home_Bullpen_ERA_L5"]
-    )  # Flipped because lower ERA is better
-    df["SP_ERA_Diff"] = df["Away_SP_PreGame_ERA"] - df["Home_SP_PreGame_ERA"]  # Flipped
+    df["Bullpen_ERA_Diff"] = df["Away_Bullpen_ERA_L5"] - df["Home_Bullpen_ERA_L5"]
+    df["SP_FIP_Diff"] = (
+        df["Away_SP_PreGame_FIP"] - df["Home_SP_PreGame_FIP"]
+    )  # NEW FIP DIFF
     df["SP_K9_Diff"] = df["Home_SP_PreGame_K9"] - df["Away_SP_PreGame_K9"]
 
-    # Define our target
     target = "Home_Win"
-
-    # We ONLY feed the model the differentials and the environmental context.
-    # We are dropping the raw team stats and the toxic 'Played_Yesterday' binary flags.
     features = [
-        "Park_Factor",  # NEW FEATURE!
+        "Park_Factor",
         "OPS_Diff",
         "K_Rate_Diff",
         "Bullpen_ERA_Diff",
-        "SP_ERA_Diff",
+        "SP_FIP_Diff",  # Add FIP Diff here
         "SP_K9_Diff",
     ]
 
-    print(f"Training on {len(features)} Differential Features: {features}")
+    print(f"Training on 6 Differential Features: {features}")
 
-    # ==========================================
-    # CHRONOLOGICAL SPLIT (Train on Past, Test on Future)
-    # ==========================================
     train_df = df[df["Date"].dt.year < 2026].copy()
     test_df = df[df["Date"].dt.year >= 2026].copy()
 
@@ -51,26 +38,22 @@ def train_baseline_model(filepath):
     X_test = test_df[features]
     y_test = test_df[target]
 
-    # ==========================================
-    # TRAIN XGBOOST (With Early Stopping)
-    # ==========================================
     print("\nTraining XGBoost model...")
     model = XGBClassifier(
-        n_estimators=500,  # Give it plenty of runway
-        learning_rate=0.01,  # Very slow, cautious learning
-        max_depth=3,  # Shallow trees to prevent memorization
+        n_estimators=500,
+        learning_rate=0.01,
+        max_depth=3,
         subsample=0.8,
         colsample_bytree=0.8,
-        early_stopping_rounds=20,  # Stop if 20 trees go by without improvement
+        early_stopping_rounds=20,
         random_state=42,
     )
 
-    # We pass the 2026 test set into the fit function so it can monitor itself
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
-
     print(f"Early stopping triggered! Model stopped at tree #{model.best_iteration}")
+
     # ==========================================
-    # EVALUATE
+    # EVALUATE & GENERATE BETTING TICKET
     # ==========================================
     y_pred = model.predict(X_test)
     y_pred_proba = model.predict_proba(X_test)[:, 1]
@@ -82,18 +65,44 @@ def train_baseline_model(filepath):
     print(f"Accuracy: {acc:.2%}")
     print(f"Log Loss: {ll:.4f}")
 
-    home_win_rate = y_test.mean()
-    print(
-        f"(Baseline: If you just guessed Home Team every game, accuracy would be {home_win_rate:.2%})"
-    )
+    # ---------------------------------------------------------
+    # THE BETTING TICKET: Let's see what it's actually thinking
+    # ---------------------------------------------------------
+    # Attach probabilities back to the test dataframe
+    results_df = test_df[["Date", "Away_Team", "Home_Team", "Home_Win"]].copy()
+    results_df["Home_Prob"] = y_pred_proba
+    results_df["Away_Prob"] = 1 - y_pred_proba
 
+    # Did the model correctly predict the winner?
+    results_df["Correct"] = y_pred == results_df["Home_Win"]
+
+    print("\n" + "=" * 50)
+    print("🎫 TOP 5 MOST CONFIDENT HOME BETS (2026) 🎫")
+    print("=" * 50)
+    top_home = results_df.sort_values(by="Home_Prob", ascending=False).head(5)
+    for _, row in top_home.iterrows():
+        status = "✅ WON" if row["Correct"] else "❌ LOST"
+        print(
+            f"{row['Date'].strftime('%m-%d')}: {row['Away_Team']} @ {row['Home_Team']} | Model: {row['Home_Team']} ({row['Home_Prob']:.1%}) -> {status}"
+        )
+
+    print("\n" + "=" * 50)
+    print("🎫 TOP 5 MOST CONFIDENT AWAY UPSETS (2026) 🎫")
+    print("=" * 50)
+    top_away = results_df.sort_values(by="Away_Prob", ascending=False).head(5)
+    for _, row in top_away.iterrows():
+        status = "✅ WON" if row["Correct"] else "❌ LOST"
+        print(
+            f"{row['Date'].strftime('%m-%d')}: {row['Away_Team']} @ {row['Home_Team']} | Model: {row['Away_Team']} ({row['Away_Prob']:.1%}) -> {status}"
+        )
+
+    print("\nFeature Importance:")
     importance = pd.DataFrame(
         {"Feature": features, "Importance": model.feature_importances_}
     ).sort_values(by="Importance", ascending=False)
-
-    print("\nFeature Importance:")
     print(importance)
 
 
 if __name__ == "__main__":
     train_baseline_model("data/mlb_model_ready.csv")
+

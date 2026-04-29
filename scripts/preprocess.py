@@ -327,4 +327,3 @@ def build_predictive_dataset(filepath):
 if __name__ == "__main__":
     model_data = build_predictive_dataset("data/mlb_historical_games.csv")
     model_data.to_csv("data/mlb_model_ready.csv", index=False)
-

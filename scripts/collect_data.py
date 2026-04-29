@@ -23,10 +23,7 @@ def get_season_game_ids(year):
     if "dates" in data:
         for date_obj in data["dates"]:
             for game in date_obj["games"]:
-                if game["status"]["statusCode"] in [
-                    "F",
-                    "O",
-                ]:  # Caught the 'Game Over' edge case!
+                if game["status"]["statusCode"] in ["F", "O"]:
                     game_ids.append(game["gamePk"])
 
     print(f"Found {len(game_ids)} completed regular season games for {year}.")
@@ -61,7 +58,8 @@ def fetch_game(game_pk):
         away_pitch = boxscore["away"]["teamStats"]["pitching"]
         home_pitch = boxscore["home"]["teamStats"]["pitching"]
 
-        away_sp_er, away_sp_ip, away_sp_k = 0, "0.0", 0
+        # UPGRADE: Now pulling Strikeouts (K), Walks (BB), and Home Runs (HR)
+        away_sp_er, away_sp_ip, away_sp_k, away_sp_bb, away_sp_hr = 0, "0.0", 0, 0, 0
         if away_sp_id:
             s = (
                 boxscore["away"]["players"]
@@ -72,8 +70,10 @@ def fetch_game(game_pk):
             away_sp_er = s.get("earnedRuns", 0)
             away_sp_ip = s.get("inningsPitched", "0.0")
             away_sp_k = s.get("strikeOuts", 0)
+            away_sp_bb = s.get("baseOnBalls", 0)
+            away_sp_hr = s.get("homeRuns", 0)
 
-        home_sp_er, home_sp_ip, home_sp_k = 0, "0.0", 0
+        home_sp_er, home_sp_ip, home_sp_k, home_sp_bb, home_sp_hr = 0, "0.0", 0, 0, 0
         if home_sp_id:
             s = (
                 boxscore["home"]["players"]
@@ -84,6 +84,8 @@ def fetch_game(game_pk):
             home_sp_er = s.get("earnedRuns", 0)
             home_sp_ip = s.get("inningsPitched", "0.0")
             home_sp_k = s.get("strikeOuts", 0)
+            home_sp_bb = s.get("baseOnBalls", 0)
+            home_sp_hr = s.get("homeRuns", 0)
 
         return [
             game_pk,
@@ -94,7 +96,6 @@ def fetch_game(game_pk):
             home_sp_name,
             away_score,
             home_score,
-            # Raw Offense - Away
             away_bat.get("atBats", 0),
             away_bat.get("hits", 0),
             away_bat.get("doubles", 0),
@@ -104,7 +105,6 @@ def fetch_game(game_pk):
             away_bat.get("hitByPitch", 0),
             away_bat.get("sacFlies", 0),
             away_bat.get("strikeOuts", 0),
-            # Raw Offense - Home
             home_bat.get("atBats", 0),
             home_bat.get("hits", 0),
             home_bat.get("doubles", 0),
@@ -114,22 +114,23 @@ def fetch_game(game_pk):
             home_bat.get("hitByPitch", 0),
             home_bat.get("sacFlies", 0),
             home_bat.get("strikeOuts", 0),
-            # Team Pitching (For Bullpen Math)
             away_pitch.get("earnedRuns", 0),
             away_pitch.get("inningsPitched", "0.0"),
             home_pitch.get("earnedRuns", 0),
             home_pitch.get("inningsPitched", "0.0"),
-            # Starter Pitching
             away_sp_er,
             away_sp_ip,
             away_sp_k,
+            away_sp_bb,
+            away_sp_hr,  # Added BB and HR
             home_sp_er,
             home_sp_ip,
             home_sp_k,
+            home_sp_bb,
+            home_sp_hr,  # Added BB and HR
             home_win,
         ]
     except Exception as e:
-        # print(f"Skipping game {game_pk}: {e}") # Commented out to keep terminal clean during threading
         return None
 
 
@@ -139,8 +140,8 @@ def build_dataset(years, output_filename, max_workers=10):
         all_game_ids.extend(get_season_game_ids(year))
 
     print(f"\nTotal games to process: {len(all_game_ids)}")
-    print(f"Starting parallel extraction with {max_workers} workers...")
 
+    # Updated Headers
     header = [
         "Game_ID",
         "Date",
@@ -175,9 +176,13 @@ def build_dataset(years, output_filename, max_workers=10):
         "Away_SP_ER",
         "Away_SP_IP",
         "Away_SP_K",
+        "Away_SP_BB",
+        "Away_SP_HR",
         "Home_SP_ER",
         "Home_SP_IP",
         "Home_SP_K",
+        "Home_SP_BB",
+        "Home_SP_HR",
         "Home_Win",
     ]
 
@@ -205,5 +210,4 @@ def build_dataset(years, output_filename, max_workers=10):
 if __name__ == "__main__":
     seasons_to_pull = [2024, 2025, 2026]
     output_file = "data/mlb_historical_games.csv"
-    build_dataset(seasons_to_pull, output_file, max_workers=15)  # Bumped workers to 15!
-
+    build_dataset(seasons_to_pull, output_file, max_workers=15)
