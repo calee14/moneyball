@@ -1,82 +1,126 @@
+"""
+Hyperparameter sweep for the Elo engine.
+
+For each combination of (K, GS2_TO_ELO, SP_DELTA_CAP, HOME_FIELD_ADV),
+runs the full backtest and records OOS logloss/brier/accuracy.
+
+Best combo by OOS logloss is the one to use in production.
+
+Usage:
+    python tune.py data/mlb_games_with_features.csv 2026
+"""
+
+import sys
+import itertools
+import math
 import pandas as pd
-from xgboost import XGBClassifier
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
-# Import the shared feature builder so tune and train always stay in sync
-import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
-from train import build_features
+import elo_engine
+from elo_engine import EloEngine, attach_penalties
 
 
-def tune_xgboost(filepath):
-    print("Loading model-ready data...")
-    df = pd.read_csv(filepath)
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
+def run_one(df, holdout_season, K, gs2_mult, sp_cap, hfa):
+    """Train + evaluate with one parameter combo. Returns metrics dict."""
+    # Patch module-level constants. Hacky but contained.
+    elo_engine.K_FACTOR = K
+    elo_engine.GS2_TO_ELO = gs2_mult
+    elo_engine.SP_DELTA_CAP = sp_cap
+    elo_engine.HOME_FIELD_ADV = hfa
 
-    df = build_features(df)
+    engine = EloEngine()
+    preds = []
+    for _, row in df.iterrows():
+        preds.append(engine.process_game(row))
+    pred_df = pd.DataFrame(preds)
 
-    features = [
-        "Park_Factor",
-        "OPS_Diff",
-        "K_Rate_Diff",
-        "Bullpen_ERA_Diff",
-        "SP_FIP_Diff",
-        "SP_K9_Diff",
-        "Bullpen_Fatigue_Diff",
-        "OPS_Diff_S",
-        "K_Rate_Diff_S",
-        "SP_K9_Diff_S",
-        "RunDiff_Diff",
-        "Rest_Diff",
-        "SP_Rest_Diff",
-        "Home_Win_Rate",
-    ]
-    target = "Home_Win"
+    # Evaluate on holdout, post-warmup (first 30 games skipped)
+    held = pred_df[pred_df["Season"] == holdout_season]
+    if len(held) <= 30:
+        return None
+    held = held.iloc[30:]
+    p = held["p_home_win"].clip(1e-6, 1 - 1e-6)
+    y = held["actual_home_win"]
+    logloss = -(y * (p.map(math.log)) + (1 - y) * ((1 - p).map(math.log))).mean()
+    brier = ((p - y) ** 2).mean()
+    acc = ((p > 0.5).astype(int) == y).mean()
 
-    # Only tune on pre-2026 data
-    train_df = df[df["Date"].dt.year < 2026].copy()
-    X_train = train_df[features]
-    y_train = train_df[target]
+    # Also report rating spread — bad sign if it's tiny
+    ratings = list(engine.team_elo.values())
+    spread = max(ratings) - min(ratings) if ratings else 0
 
-    print(f"Starting Grid Search on {len(X_train)} historical games...")
-
-    param_grid = {
-        "max_depth": [3, 4, 5],
-        "learning_rate": [0.01, 0.03, 0.05],
-        "n_estimators": [200, 400, 600],
-        "subsample": [0.7, 0.8],
-        "colsample_bytree": [0.7, 0.8, 1.0],
-        "min_child_weight": [3, 5, 8],
-        "gamma": [0, 0.5, 1.0],
+    return {
+        "K": K,
+        "gs2_mult": gs2_mult,
+        "sp_cap": sp_cap,
+        "hfa": hfa,
+        "logloss": logloss,
+        "brier": brier,
+        "acc": acc,
+        "rating_spread": spread,
+        "n": len(held),
     }
 
-    # TimeSeriesSplit ensures no future-data leakage during cross-validation
-    tscv = TimeSeriesSplit(n_splits=5)
 
-    model = XGBClassifier(random_state=42, eval_metric="logloss")
-    grid_search = GridSearchCV(
-        estimator=model,
-        param_grid=param_grid,
-        scoring="neg_log_loss",
-        cv=tscv,
-        verbose=1,
-        n_jobs=-1,
+def main():
+    in_path = sys.argv[1] if len(sys.argv) > 1 else "data/mlb_games_with_features.csv"
+    holdout = int(sys.argv[2]) if len(sys.argv) > 2 else 2026
+
+    print(f"Loading {in_path}...")
+    df = pd.read_csv(in_path)
+    df = attach_penalties(df)
+    if "Game_DateTime" in df.columns:
+        df["_sort"] = pd.to_datetime(df["Game_DateTime"], errors="coerce", utc=True)
+    else:
+        df["_sort"] = pd.to_datetime(df["Date"])
+    df = df.sort_values(["_sort", "Game_Number"]).reset_index(drop=True)
+    print(f"  {len(df)} games, holdout={holdout}\n")
+
+    # Grid. Keep it modest — 81 combos is plenty for a first pass.
+    K_grid = [3, 5, 7, 9]
+    gs2_grid = [1.0, 2.0, 3.0]
+    cap_grid = [40, 60, 80]
+    hfa_grid = [18, 24, 30]
+
+    combos = list(itertools.product(K_grid, gs2_grid, cap_grid, hfa_grid))
+    print(f"Sweeping {len(combos)} combinations...\n")
+
+    results = []
+    for i, (K, gs2, cap, hfa) in enumerate(combos, 1):
+        r = run_one(df, holdout, K, gs2, cap, hfa)
+        if r:
+            results.append(r)
+        if i % 10 == 0:
+            print(f"  {i}/{len(combos)} done")
+
+    res_df = pd.DataFrame(results).sort_values("logloss")
+    print("\n=== Top 10 (lowest OOS logloss) ===")
+    print(res_df.head(10).to_string(index=False))
+    print("\n=== Bottom 5 (worst) ===")
+    print(res_df.tail(5).to_string(index=False))
+
+    # Marginal effect of each param: avg logloss when fixed at each value
+    print("\n=== Marginal effects (avg logloss when this param = value) ===")
+    for col in ["K", "gs2_mult", "sp_cap", "hfa"]:
+        marg = res_df.groupby(col)["logloss"].mean().round(4)
+        print(f"\n  {col}:")
+        for k, v in marg.items():
+            print(f"    {k}: {v}")
+
+    res_df.to_csv("data/tune_results.csv", index=False)
+    print("\nFull results -> data/tune_results.csv")
+
+    best = res_df.iloc[0]
+    print(f"\n=== Best combo ===")
+    print(
+        f"  K={int(best.K)}  GS2_TO_ELO={best.gs2_mult}  "
+        f"SP_DELTA_CAP={int(best.sp_cap)}  HOME_FIELD_ADV={int(best.hfa)}"
     )
-
-    grid_search.fit(X_train, y_train)
-
-    print("\n" + "=" * 40)
-    print("BEST XGBOOST SETTINGS FOUND")
-    print("=" * 40)
-
-    best_params = grid_search.best_params_
-    for key, value in best_params.items():
-        print(f"{key}: {value}")
-
-    print(f"\nBest Historical Log Loss: {-grid_search.best_score_:.4f}")
-    print("\nCopy these settings into your train.py script!")
+    print(
+        f"  -> logloss={best.logloss:.4f}  acc={best.acc:.4f}  "
+        f"rating_spread={best.rating_spread:.0f}"
+    )
 
 
 if __name__ == "__main__":
-    tune_xgboost("data/mlb_model_ready.csv")
+    main()
+
