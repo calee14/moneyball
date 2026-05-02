@@ -29,6 +29,9 @@ from textual.reactive import reactive
 from textual.widgets import DataTable, Footer, Header, Static
 from textual.worker import Worker, WorkerState
 
+from rich.table import Table
+from rich.text import Text
+
 from fetch_upcoming import UpcomingGame, fetch_upcoming_games
 from elo_predictor import GamePrediction, TeamContext, get_predictor
 import elo_predictor
@@ -77,15 +80,16 @@ class ComparisonPanel(Vertical):
         border: solid $accent;
         height: 100%;
         width: 1fr;
-        padding: 0 1;
+        padding: 1;
     }
     ComparisonPanel > #cp_header {
-        padding: 1 1 0 1;
+        padding: 0 1 1 1;
         height: auto;
         background: $surface;
+        border-bottom: solid $panel;
     }
     ComparisonPanel > #cp_winprob {
-        padding: 1 1;
+        padding: 1;
         height: auto;
     }
     ComparisonPanel > #cp_compare {
@@ -107,7 +111,7 @@ class ComparisonPanel(Vertical):
         yield Static("", id="cp_compare", markup=True)
         yield Static("", id="cp_notes", markup=True)
 
-    def _set(self, sel: str, content: str) -> None:
+    def _set(self, sel: str, content: object) -> None:
         self.query_one(sel, Static).update(content)
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -166,104 +170,95 @@ class ComparisonPanel(Vertical):
         )
 
     @staticmethod
-    def _build_winprob(pred: GamePrediction) -> str:
-        # Pure-Elo win prob bar with both teams
+    def _build_winprob(pred: GamePrediction) -> Text:
         a_pct = pred.p_away_win
         h_pct = pred.p_home_win
         bar_w = 40
         a_blocks = round(a_pct * bar_w)
-        h_blocks = bar_w - a_blocks
-        bar = f"[cyan]{'█' * a_blocks}[/cyan][magenta]{'█' * h_blocks}[/magenta]"
+        bar = Text("█" * bar_w)
+        bar.stylize("cyan", 0, a_blocks)
+        bar.stylize("magenta", a_blocks, bar_w)
+
+        team_col = 22
+        text = Text()
+        text.append("Win Probability (pure team Elo)\n\n", style="bold")
+        text.append(Text(pred.away.team_name.ljust(team_col), style="cyan"))
+        text.append(" ")
+        text.append(bar)
+        text.append(" ")
+        text.append(Text(pred.home.team_name + "\n", style="magenta"))
+
+        text.append(Text(_fmt_pct(a_pct).rjust(team_col), style="cyan"))
+        text.append(" ")
+        text.append(" " * bar_w)
+        text.append(" ")
+        text.append(Text(_fmt_pct(h_pct) + "\n", style="magenta"))
 
         favored = pred.home if pred.pick_team == "home" else pred.away
-        underdog = pred.away if pred.pick_team == "home" else pred.home
         favored_pct = max(a_pct, h_pct)
 
-        return (
-            f"[bold]Win Probability  (pure team Elo)[/bold]\n"
-            f"[cyan]{pred.away.team_name:<24}[/cyan] {bar} "
-            f"[magenta]{pred.home.team_name}[/magenta]\n"
-            f"[cyan]{_fmt_pct(a_pct):>8}[/cyan]"
-            f"{' ' * (bar_w - 5)}"
-            f"[magenta]{_fmt_pct(h_pct):<8}[/magenta]\n"
-            f"\n"
-            f"  Pick: [bold green]{favored.team_name}[/bold green]  "
-            f"([yellow]{pred.pick_confidence}[/yellow], "
-            f"{_fmt_pct(favored_pct)} vs {_fmt_pct(1 - favored_pct)})"
+        text.append("\n")
+        text.append("Pick: ")
+        text.append(favored.team_name, style="bold green")
+        text.append(
+            f" ({pred.pick_confidence}, {_fmt_pct(favored_pct)} vs {_fmt_pct(1 - favored_pct)})"
         )
+        return text
 
     @staticmethod
-    def _build_comparison(pred: GamePrediction) -> str:
+    def _build_comparison(pred: GamePrediction) -> Table:
         a, h = pred.away, pred.home
-        col_w = 22
 
-        def row(label: str, a_val: str, h_val: str, edge: str = "") -> str:
-            return (
-                f"  [dim]{label:<22}[/dim]  "
-                f"[cyan]{a_val:<{col_w}}[/cyan]"
-                f"[magenta]{h_val:<{col_w}}[/magenta]"
-                f"{edge}"
-            )
+        def _safe(val: float | None, fmt: str = "{:.1f}", suffix: str = "") -> str:
+            if val is None or _isnan(val):
+                return "n/a"
+            return (fmt + suffix).format(val)
 
-        # Compute edges
+        table = Table(show_header=True, box=None, padding=(0, 1), expand=True)
+        table.add_column("", style="dim", no_wrap=True)
+        table.add_column(a.team_name, style="cyan", no_wrap=True, justify="left")
+        table.add_column(h.team_name, style="magenta", no_wrap=True, justify="left")
+        table.add_column("Edge (home)", style="bold", no_wrap=True, justify="left")
+
         elo_edge = _fmt_diff(a.elo, h.elo)
         l10_w_edge = _fmt_diff(a.last_10_wins, h.last_10_wins)
         rd_edge = _fmt_diff(a.last_10_run_diff, h.last_10_run_diff)
         rest_edge = _fmt_diff(a.days_rest, h.days_rest, "d")
-        # Bullpen: lower is better (less fatigue), so invert
         pen_edge = _fmt_diff(a.bullpen_ip_last3, h.bullpen_ip_last3, " IP", invert=True)
 
-        l10_a = f"{a.last_10_wins}-{a.last_10_losses}"
-        l10_h = f"{h.last_10_wins}-{h.last_10_losses}"
+        l10_a = f"{a.last_10_wins:.0f}-{a.last_10_losses:.0f}"
+        l10_h = f"{h.last_10_wins:.0f}-{h.last_10_losses:.0f}"
         rd_a = f"{'+' if a.last_10_run_diff > 0 else ''}{a.last_10_run_diff}"
         rd_h = f"{'+' if h.last_10_run_diff > 0 else ''}{h.last_10_run_diff}"
         ar_a = f"{a.away_record[0]}-{a.away_record[1]} (away)"
         hr_h = f"{h.home_record[0]}-{h.home_record[1]} (home)"
-        rest_a = f"{a.days_rest:.1f}d" if not _isnan(a.days_rest) else "n/a"
-        rest_h = f"{h.days_rest:.1f}d" if not _isnan(h.days_rest) else "n/a"
-        pen_a = (
-            f"{a.bullpen_ip_last3:.1f} IP" if not _isnan(a.bullpen_ip_last3) else "n/a"
-        )
-        pen_h = (
-            f"{h.bullpen_ip_last3:.1f} IP" if not _isnan(h.bullpen_ip_last3) else "n/a"
+        rest_a = _safe(a.days_rest, "{:.1f}", "d")
+        rest_h = _safe(h.days_rest, "{:.1f}", "d")
+        pen_a = _safe(a.bullpen_ip_last3, "{:.1f}", " IP")
+        pen_h = _safe(h.bullpen_ip_last3, "{:.1f}", " IP")
+
+        def _sp_era(ctx: TeamContext) -> str:
+            if ctx.starter_era_recent is not None:
+                return f"{ctx.starter_era_recent:.2f} ERA (L{ctx.starter_era_n})"
+            return "n/a"
+
+        sp_a = _sp_era(a)
+        sp_h = _sp_era(h)
+        sp_edge = (
+            _fmt_diff(a.starter_era_recent or 0.0, h.starter_era_recent or 0.0, invert=True)
+            if (a.starter_era_recent is not None and h.starter_era_recent is not None)
+            else ""
         )
 
-        # Starter recent form
-        sp_a = (
-            f"{a.starter_recent_gs2:.1f} GS2 (n={a.starter_starts_seen})"
-            if a.starter_recent_gs2 is not None
-            else "n/a"
-        )
-        sp_h = (
-            f"{h.starter_recent_gs2:.1f} GS2 (n={h.starter_starts_seen})"
-            if h.starter_recent_gs2 is not None
-            else "n/a"
-        )
+        table.add_row("Elo rating", f"{a.elo:.0f} (#{a.rank})", f"{h.elo:.0f} (#{h.rank})", Text.from_markup(elo_edge))
+        table.add_row("Last 10 record", l10_a, l10_h, Text.from_markup(l10_w_edge))
+        table.add_row("Last 10 run diff", rd_a, rd_h, Text.from_markup(rd_edge))
+        table.add_row("Season record", ar_a, hr_h, "")
+        table.add_row("Days rest", rest_a, rest_h, Text.from_markup(rest_edge))
+        table.add_row("Bullpen IP last 3", pen_a, pen_h, Text.from_markup(pen_edge))
+        table.add_row("SP recent ERA", sp_a, sp_h, Text.from_markup(sp_edge))
 
-        header = (
-            "  [bold]Comparison[/bold]"
-            f"{' ' * 16}"
-            f"[bold cyan]{a.team_name[:col_w]:<{col_w}}[/bold cyan]"
-            f"[bold magenta]{h.team_name[:col_w]:<{col_w}}[/bold magenta]"
-            f"[bold]Edge (home)[/bold]"
-        )
-        sep = "  " + "─" * (col_w * 2 + 36)
-
-        rows = [
-            row(
-                "Elo rating",
-                f"{a.elo:.0f} (#{a.rank})",
-                f"{h.elo:.0f} (#{h.rank})",
-                elo_edge,
-            ),
-            row("Last 10 record", l10_a, l10_h, l10_w_edge),
-            row("Last 10 run diff", rd_a, rd_h, rd_edge),
-            row("Season record", ar_a, hr_h, ""),
-            row("Days rest", rest_a, rest_h, rest_edge),
-            row("Bullpen IP last 3", pen_a, pen_h, pen_edge),
-            row("Starter recent", sp_a, sp_h, ""),
-        ]
-        return header + "\n" + sep + "\n" + "\n".join(rows)
+        return table
 
     @staticmethod
     def _build_notes(pred: GamePrediction) -> str:
@@ -297,7 +292,7 @@ class MoneyballApp(App):
     }
 
     #main { layout: horizontal; height: 1fr; }
-    #left  { width: 2fr; height: 100%; border: solid $panel; }
+    #left  { width: 2fr; height: 100%; border: solid $panel; padding: 0 1; }
     #right { width: 3fr; height: 100%; }
 
     DataTable { height: 1fr; }
@@ -328,9 +323,13 @@ class MoneyballApp(App):
 
     # ── mount ─────────────────────────────────────────────────────────────────
     def on_mount(self) -> None:
-        self.query_one("#game_table", DataTable).add_columns(
-            "Date", "Time (ET)", "Matchup", "Away SP", "Home SP", "Status"
-        )
+        table = self.query_one("#game_table", DataTable)
+        table.add_column("Date", width=12)
+        table.add_column("Time (ET)", width=10)
+        table.add_column("Matchup", width=30)
+        table.add_column("Away SP", width=20)
+        table.add_column("Home SP", width=20)
+        table.add_column("Status", width=10)
         self.query_one("#result", ComparisonPanel).show_placeholder()
         # Warm up the predictor in a background thread so first analysis is instant
         self._warmup_predictor()
@@ -408,13 +407,14 @@ class MoneyballApp(App):
             score = (
                 f"  {g.away_score}–{g.home_score}" if g.away_score is not None else ""
             )
+            status_cell = Text(g.status, style=style) if style else g.status
             table.add_row(
                 g.date,
                 g.game_time_et,
                 f"{g.away_team} @ {g.home_team}{score}",
                 g.away_sp,
                 g.home_sp,
-                f"[{style}]{g.status}[/]",
+                status_cell,
             )
 
     def _refresh_toolbar(self) -> None:
@@ -446,13 +446,13 @@ class MoneyballApp(App):
 
         try:
             predictor = get_predictor()
-            away_sp_id = getattr(game, "away_sp_id", None)
-            home_sp_id = getattr(game, "home_sp_id", None)
             pred = predictor.predict(
                 away_team=game.away_team,
                 home_team=game.home_team,
-                away_sp_id=away_sp_id,
-                home_sp_id=home_sp_id,
+                away_sp_id=game.away_sp_id,
+                home_sp_id=game.home_sp_id,
+                away_sp=game.away_sp,
+                home_sp=game.home_sp,
             )
             panel.show_prediction(pred, game)
         except Exception as e:

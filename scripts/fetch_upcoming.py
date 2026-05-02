@@ -31,6 +31,8 @@ class UpcomingGame:
     status: str        # "Upcoming" | "Live" | "Final"
     away_score: int | None = None
     home_score: int | None = None
+    away_sp_id: int | None = None  # MLB pitcher ID, None if TBD
+    home_sp_id: int | None = None
 
 
 def fetch_upcoming_games(
@@ -81,6 +83,11 @@ def fetch_upcoming_games(
             away_score = away.get("score")
             home_score = home.get("score")
 
+            away_pp = away.get("probablePitcher", {})
+            home_pp = home.get("probablePitcher", {})
+            away_sp_id_raw = away_pp.get("id")
+            home_sp_id_raw = home_pp.get("id")
+
             games.append(
                 UpcomingGame(
                     game_pk=g["gamePk"],
@@ -88,11 +95,13 @@ def fetch_upcoming_games(
                     game_time_et=game_time_et,
                     away_team=away["team"]["name"],
                     home_team=home["team"]["name"],
-                    away_sp=away.get("probablePitcher", {}).get("fullName", "TBD"),
-                    home_sp=home.get("probablePitcher", {}).get("fullName", "TBD"),
+                    away_sp=away_pp.get("fullName", "TBD"),
+                    home_sp=home_pp.get("fullName", "TBD"),
                     status=status,
                     away_score=away_score if status != "Upcoming" else None,
                     home_score=home_score if status != "Upcoming" else None,
+                    away_sp_id=int(away_sp_id_raw) if away_sp_id_raw is not None else None,
+                    home_sp_id=int(home_sp_id_raw) if home_sp_id_raw is not None else None,
                 )
             )
 

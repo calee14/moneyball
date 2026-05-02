@@ -43,6 +43,18 @@ def _safe_int(x) -> Optional[int]:
         return None
 
 
+def _parse_ip(s) -> float:
+    """Convert MLB innings-pitched string/number to decimal (e.g. '6.2' -> 6.667)."""
+    try:
+        ip = str(s)
+        if "." in ip:
+            w, fr = ip.split(".", 1)
+            return int(w) + int(fr) / 3.0
+        return float(ip)
+    except Exception:
+        return 0.0
+
+
 # ── data structures ───────────────────────────────────────────────────────────
 @dataclass
 class TeamContext:
@@ -63,6 +75,13 @@ class TeamContext:
     is_day_after_night: bool
     starter_recent_gs2: Optional[float]  # avg GS2 last 3 starts, None if unknown
     starter_starts_seen: int
+    starter_fip: Optional[float]  # rolling pre-game FIP, None if unknown
+    starter_k9: Optional[float]   # rolling pre-game K/9, None if unknown
+    starter_era_recent: Optional[float]  # ER/IP * 9 over last 3 starts, None if unknown
+    starter_era_n: int                   # number of starts used for era_recent
+    matchup_rpg: Optional[float]  # this team's runs/game vs opp SP historically
+    matchup_delta: Optional[float]  # vs this team's season runs/game average
+    matchup_n: int                  # number of historical matchup games
 
 
 @dataclass
@@ -106,9 +125,11 @@ class EloPredictor:
         self,
         snapshot_path: str = "data/ratings_snapshot.json",
         features_csv: str = "data/mlb_games_with_features.csv",
+        model_ready_csv: str = "data/mlb_model_ready.csv",
     ):
         self.snapshot_path = Path(snapshot_path)
         self.features_csv = Path(features_csv)
+        self.model_ready_csv = Path(model_ready_csv)
 
         if not self.snapshot_path.exists():
             raise FileNotFoundError(
@@ -141,6 +162,30 @@ class EloPredictor:
         )
         self.df = self.df.sort_values("_dt").reset_index(drop=True)
 
+        # Load model-ready CSV for per-pitcher FIP/K9 lookup (by name)
+        # Build a dict: pitcher_name -> {"fip": float, "k9": float}
+        self._sp_fip: dict[str, tuple[float, float]] = {}
+        if self.model_ready_csv.exists():
+            mr = pd.read_csv(self.model_ready_csv)
+            if "Date" not in mr.columns:
+                mr = mr.sort_index()
+            else:
+                mr = mr.sort_values("Date")
+            for side, name_col, fip_col, k9_col in (
+                ("Home", "Home_SP", "Home_SP_PreGame_FIP", "Home_SP_PreGame_K9"),
+                ("Away", "Away_SP", "Away_SP_PreGame_FIP", "Away_SP_PreGame_K9"),
+            ):
+                if name_col not in mr.columns:
+                    continue
+                subset = mr[[name_col, fip_col, k9_col]].dropna()
+                for _, row in subset.iterrows():
+                    name = row[name_col]
+                    fip = float(row[fip_col])
+                    k9 = float(row[k9_col])
+                    # Zero FIP/K9 means no prior data (first start of season) — skip
+                    if fip != 0.0 or k9 != 0.0:
+                        self._sp_fip[name] = (fip, k9)
+
         # Build name -> team_id lookup (covers both away and home appearances)
         name_to_id: dict[str, int] = {}
         for _, row in (
@@ -169,6 +214,84 @@ class EloPredictor:
         self.current_season = (
             self.df["_dt"].max().year if len(self.df) else date.today().year
         )
+
+        # Build team-vs-SP matchup table from the historical games CSV.
+        # Key: (batting_team_id: int, opp_sp_id: int) -> list[float] of runs scored.
+        # Also keep a by-name version for when we only have SP name.
+        # Structure: (batting_team_id, opp_sp_name) -> [runs, ...]
+        self._matchup_by_id: dict[tuple[int, int], list[float]] = {}
+        self._matchup_by_name: dict[tuple[int, str], list[float]] = {}
+        # Per-team season run average for computing deltas
+        self._team_rpg: dict[int, float] = {}
+
+        raw = pd.read_csv(self.snapshot_path.parent.parent / "data" / "mlb_historical_games.csv")
+        cur_yr = self.current_season
+        season_raw = raw[pd.to_datetime(raw["Date"], errors="coerce").dt.year == cur_yr]
+
+        # Team season runs/game average (current season)
+        for tid in self.name_to_id.values():
+            away_runs = season_raw[season_raw["Away_Team_ID"] == tid]["Away_Score"].dropna()
+            home_runs = season_raw[season_raw["Home_Team_ID"] == tid]["Home_Score"].dropna()
+            all_runs = pd.concat([away_runs, home_runs])
+            if len(all_runs) >= 5:
+                self._team_rpg[tid] = float(all_runs.mean())
+
+        # Build SP recent ER/IP lookup from raw game logs.
+        # Stores (date, er, ip_decimal) tuples per pitcher, sorted chronologically.
+        # Key: sp_id (int) or sp_name (str)
+        self._sp_er_by_id: dict[int, list[tuple[float, float]]] = {}   # id -> [(er, ip), ...]
+        self._sp_er_by_name: dict[str, list[tuple[float, float]]] = {}  # name -> [(er, ip), ...]
+
+        sp_er_cols = {"Away_SP_ID", "Away_SP", "Away_SP_ER", "Away_SP_IP",
+                      "Home_SP_ID", "Home_SP", "Home_SP_ER", "Home_SP_IP", "Date"}
+        if sp_er_cols.issubset(set(raw.columns)):
+            raw_sorted = raw.sort_values("Date", na_position="last")
+            for _, r in raw_sorted.iterrows():
+                for side in ("Away", "Home"):
+                    sp_id = _safe_int(r[f"{side}_SP_ID"])
+                    sp_name = str(r[f"{side}_SP"]) if pd.notna(r[f"{side}_SP"]) else ""
+                    er_raw = r[f"{side}_SP_ER"]
+                    ip_raw = r[f"{side}_SP_IP"]
+                    if not pd.notna(er_raw) or not pd.notna(ip_raw):
+                        continue
+                    er = float(er_raw)
+                    ip = _parse_ip(ip_raw)
+                    if ip <= 0:
+                        continue
+                    entry = (er, ip)
+                    if sp_id is not None:
+                        self._sp_er_by_id.setdefault(sp_id, []).append(entry)
+                    if sp_name:
+                        self._sp_er_by_name.setdefault(sp_name, []).append(entry)
+
+        # Build matchup lookup: away team batted vs home SP; home team batted vs away SP
+        needed_cols = {"Away_Team_ID", "Away_Score", "Home_SP_ID", "Home_SP",
+                       "Home_Team_ID", "Home_Score", "Away_SP_ID", "Away_SP"}
+        if needed_cols.issubset(set(raw.columns)):
+            for _, r in raw.iterrows():
+                # Away team batted against Home SP
+                a_tid = _safe_int(r["Away_Team_ID"])
+                h_sp_id = _safe_int(r["Home_SP_ID"])
+                h_sp_name = str(r["Home_SP"]) if pd.notna(r["Home_SP"]) else ""
+                a_runs = r["Away_Score"]
+                if a_tid is not None and pd.notna(a_runs):
+                    a_runs_f = float(a_runs)
+                    if h_sp_id is not None:
+                        self._matchup_by_id.setdefault((a_tid, h_sp_id), []).append(a_runs_f)
+                    if h_sp_name:
+                        self._matchup_by_name.setdefault((a_tid, h_sp_name), []).append(a_runs_f)
+
+                # Home team batted against Away SP
+                h_tid = _safe_int(r["Home_Team_ID"])
+                a_sp_id = _safe_int(r["Away_SP_ID"])
+                a_sp_name = str(r["Away_SP"]) if pd.notna(r["Away_SP"]) else ""
+                h_runs = r["Home_Score"]
+                if h_tid is not None and pd.notna(h_runs):
+                    h_runs_f = float(h_runs)
+                    if a_sp_id is not None:
+                        self._matchup_by_id.setdefault((h_tid, a_sp_id), []).append(h_runs_f)
+                    if a_sp_name:
+                        self._matchup_by_name.setdefault((h_tid, a_sp_name), []).append(h_runs_f)
 
     # ── lookups ───────────────────────────────────────────────────────────────
     def resolve_team(self, name: str) -> Optional[int]:
@@ -223,6 +346,13 @@ class EloPredictor:
                 is_day_after_night=False,
                 starter_recent_gs2=None,
                 starter_starts_seen=0,
+                starter_fip=None,
+                starter_k9=None,
+                starter_era_recent=None,
+                starter_era_n=0,
+                matchup_rpg=None,
+                matchup_delta=None,
+                matchup_n=0,
             )
 
         hist = self._team_perspective(hist, team_id)
@@ -307,6 +437,13 @@ class EloPredictor:
             is_day_after_night=is_dan,
             starter_recent_gs2=None,  # filled in by predict() if SP id given
             starter_starts_seen=0,
+            starter_fip=None,         # filled in by predict() if SP name given
+            starter_k9=None,
+            starter_era_recent=None,  # filled in by predict() if SP name given
+            starter_era_n=0,
+            matchup_rpg=None,         # filled in by predict() via team_vs_sp()
+            matchup_delta=None,
+            matchup_n=0,
         )
 
     def starter_form(self, sp_id) -> tuple[Optional[float], int]:
@@ -320,9 +457,89 @@ class EloPredictor:
         recent = history[-3:]
         return (round(sum(recent) / len(recent), 1), len(history))
 
+    def starter_fip_by_name(self, sp_name: str) -> tuple[Optional[float], Optional[float]]:
+        """Return (pre-game FIP, pre-game K/9) for a starter looked up by name."""
+        if not sp_name or sp_name == "TBD":
+            return (None, None)
+        entry = self._sp_fip.get(sp_name)
+        if entry is None:
+            return (None, None)
+        fip, k9 = entry
+        return (round(fip, 2), round(k9, 1))
+
+    def starter_era_recent_by_id_or_name(
+        self,
+        sp_id=None,
+        sp_name: str = "",
+        n_starts: int = 3,
+    ) -> tuple[Optional[float], int]:
+        """
+        Return (recent ERA, n_starts_used) for a starter from their last `n_starts`
+        outings.  ERA = (total ER / total IP) * 9.  Prefers ID lookup, falls back
+        to name.  Returns (None, 0) when the pitcher has no data.
+        """
+        starts: list[tuple[float, float]] = []
+
+        sp_id_int = _safe_int(sp_id)
+        if sp_id_int is not None:
+            starts = self._sp_er_by_id.get(sp_id_int, [])
+
+        if not starts and sp_name and sp_name not in ("TBD", ""):
+            starts = self._sp_er_by_name.get(sp_name, [])
+
+        if not starts:
+            return (None, 0)
+
+        recent = starts[-n_starts:]
+        total_er = sum(er for er, _ip in recent)
+        total_ip = sum(ip for _er, ip in recent)
+        if total_ip == 0:
+            return (None, 0)
+
+        era = round((total_er / total_ip) * 9, 2)
+        return (era, len(recent))
+
+    def team_vs_sp(
+        self,
+        batting_team_id: int,
+        opp_sp_id: Optional[int],
+        opp_sp_name: str,
+        min_games: int = 2,
+    ) -> tuple[Optional[float], Optional[float], int]:
+        """
+        Return (runs_per_game, delta_vs_season_avg, n_games) for a batting team
+        against a specific opposing starting pitcher.
+
+        Prefers ID-based lookup; falls back to name if ID not found.
+        Returns (None, None, 0) when fewer than min_games exist.
+        """
+        runs: list[float] = []
+
+        # Try ID lookup first
+        if opp_sp_id is not None:
+            runs = self._matchup_by_id.get((batting_team_id, opp_sp_id), [])
+
+        # Fall back to name lookup
+        if not runs and opp_sp_name and opp_sp_name != "TBD":
+            runs = self._matchup_by_name.get((batting_team_id, opp_sp_name), [])
+
+        if len(runs) < min_games:
+            return (None, None, len(runs))
+
+        rpg = round(sum(runs) / len(runs), 2)
+        season_avg = self._team_rpg.get(batting_team_id)
+        delta = round(rpg - season_avg, 2) if season_avg is not None else None
+        return (rpg, delta, len(runs))
+
     # ── main entry point ──────────────────────────────────────────────────────
     def predict(
-        self, away_team: str, home_team: str, away_sp_id=None, home_sp_id=None
+        self,
+        away_team: str,
+        home_team: str,
+        away_sp_id=None,
+        home_sp_id=None,
+        away_sp: str = "",
+        home_sp: str = "",
     ) -> GamePrediction:
         away_id = self.resolve_team(away_team)
         home_id = self.resolve_team(home_team)
@@ -343,6 +560,32 @@ class EloPredictor:
             gs, n = self.starter_form(home_sp_id)
             home_ctx.starter_recent_gs2 = gs
             home_ctx.starter_starts_seen = n
+
+        # FIP/K9 fallback — looked up by name, available whenever pitcher is announced
+        away_fip, away_k9 = self.starter_fip_by_name(away_sp)
+        home_fip, home_k9 = self.starter_fip_by_name(home_sp)
+        away_ctx.starter_fip = away_fip
+        away_ctx.starter_k9 = away_k9
+        home_ctx.starter_fip = home_fip
+        home_ctx.starter_k9 = home_k9
+
+        # Recent ERA (ER/IP * 9) over last 3 starts — primary SP stat shown in TUI
+        away_era, away_era_n = self.starter_era_recent_by_id_or_name(away_sp_id, away_sp)
+        home_era, home_era_n = self.starter_era_recent_by_id_or_name(home_sp_id, home_sp)
+        away_ctx.starter_era_recent = away_era
+        away_ctx.starter_era_n = away_era_n
+        home_ctx.starter_era_recent = home_era
+        home_ctx.starter_era_n = home_era_n
+
+        # Matchup history: away team bats against home SP; home team bats against away SP
+        away_rpg, away_delta, away_n = self.team_vs_sp(away_id, home_sp_id, home_sp)
+        home_rpg, home_delta, home_n = self.team_vs_sp(home_id, away_sp_id, away_sp)
+        away_ctx.matchup_rpg = away_rpg
+        away_ctx.matchup_delta = away_delta
+        away_ctx.matchup_n = away_n
+        home_ctx.matchup_rpg = home_rpg
+        home_ctx.matchup_delta = home_delta
+        home_ctx.matchup_n = home_n
 
         # Pure team Elo win probability
         p_home = win_prob_pure(home_ctx.elo, away_ctx.elo)
